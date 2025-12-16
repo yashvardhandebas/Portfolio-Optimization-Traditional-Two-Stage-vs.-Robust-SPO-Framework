@@ -1,0 +1,116 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+import pandas as pd
+import importlib.util
+import sys
+
+
+# --- Import X_final and Y_final from yfinance data.py ---
+# Since the filename has a space, we use importlib to import it as a module
+spec = importlib.util.spec_from_file_location("yfinance_data", "yfinance data.py")
+yfinance_data = importlib.util.module_from_spec(spec)
+sys.modules["yfinance_data"] = yfinance_data
+spec.loader.exec_module(yfinance_data)
+
+# Extract the variables we need
+try:
+    X_final = yfinance_data.X_final
+    Y_final = yfinance_data.Y_final
+except AttributeError as e:
+    raise ValueError(f"Failed to import X_final or Y_final from yfinance data.py. Error: {e}\n"
+                    "Make sure yfinance data.py has been run successfully and X_final, Y_final are defined.")
+
+# Validate the imported data
+if X_final is None or Y_final is None:
+    raise ValueError("X_final or Y_final is None. Check yfinance data.py execution.")
+if X_final.empty or Y_final.empty:
+    raise ValueError("X_final or Y_final is empty. Check data processing in yfinance data.py.")
+
+print(f"\n--- Data Imported Successfully ---")
+print(f"X_final shape: {X_final.shape}")
+print(f"Y_final shape: {Y_final.shape}")
+
+# --- 1. PyTorch Data Conversion ---
+
+# Convert DataFrames to NumPy arrays, then to PyTorch tensors
+X_np = X_final.values.astype(np.float32)
+Y_np = Y_final.values.astype(np.float32)
+
+# Ensure X and Y have the same number of rows (samples)
+if X_np.shape[0] != Y_np.shape[0]:
+    raise ValueError(f"X_final and Y_final must have the same number of rows. "
+                    f"X_final: {X_np.shape[0]}, Y_final: {Y_np.shape[0]}")
+
+X_tensor = torch.tensor(X_np, dtype=torch.float32)
+Y_tensor = torch.tensor(Y_np, dtype=torch.float32)
+
+# Define shapes for the network
+N_FEATURES = X_tensor.shape[1]  # Number of input signals (e.g., 5)
+N_ASSETS = Y_tensor.shape[1]    # Number of assets (e.g., 7)
+
+print(f"Input Features: {N_FEATURES}, Output Assets: {N_ASSETS}")
+
+#the Prediction part in the model
+class PortfolioPredictor(nn.Module):
+    def __init__(self, input_size, output_size):
+        super(PortfolioPredictor, self).__init__()
+        
+        # Simple Feed-Forward Network (DNN) structure
+        # Input Layer: N_FEATURES (e.g., 5)
+        # Hidden Layer 1: 32 nodes
+        # Hidden Layer 2: 16 nodes
+        # Output Layer: N_ASSETS (e.g., 7) -> Predicted Mean Returns (mu_hat)
+        
+        self.net = nn.Sequential(
+            nn.Linear(input_size, 32),
+            nn.ReLU(),
+            nn.Linear(32, 16),
+            nn.ReLU(),
+            nn.Linear(16, output_size)
+        )
+        
+    def forward(self, x):
+        # The output is the predicted vector of mean returns (mu_hat)
+        return self.net(x)
+
+# Initialize the model
+model = PortfolioPredictor(N_FEATURES, N_ASSETS)
+
+# --- Replace the custom SPO Decision Loss with standard MSE Loss ---
+def mse_loss(mu_predicted, Y_tensor_true):
+    """
+    Standard Mean Squared Error (MSE) loss.
+    This trains the DNN to be the best possible return predictor.
+    """
+    # Calculate the squared difference between the predicted returns and the true returns.
+    return torch.mean((mu_predicted - Y_tensor_true) ** 2)
+
+# --- Training Setup ---
+optimizer = optim.Adam(model.parameters(), lr=0.001)
+N_EPOCHS = 10
+
+# --- Training Loop ---
+for epoch in range(N_EPOCHS):
+    total_loss = 0.0
+    
+    # Assume training is done on the full batch for simplicity (batch size = all data)
+    
+    # 1. Forward Pass
+    mu_predicted = model(X_tensor)
+    
+    # 2. Calculate Loss (Prediction Error via MSE across the entire batch)
+    avg_loss = mse_loss(mu_predicted, Y_tensor)
+    
+    # 3. Backward Pass (Backpropagation)
+    optimizer.zero_grad()
+    avg_loss.backward()  # Error flows back through the network
+    optimizer.step()     # Weights are updated based on the MSE Loss gradient
+    
+    total_loss += avg_loss.item()
+    
+    print(f"Epoch [{epoch+1}/{N_EPOCHS}], Loss: {total_loss:.6f}")
+
+print("\n--- Training Complete ---")
+print("The model has now learned to predict returns that minimize the MSE prediction error.")
