@@ -1,0 +1,269 @@
+import yfinance as yf
+import pandas as pd
+from datetime import datetime
+
+# The selected Indian tickers (NSE symbols for yfinance)
+TICKERS = [
+    'RELIANCE.NS',  # Conglomerate/Energy
+    'HDFCBANK.NS',  # Banking
+    'TCS.NS',       # IT Services
+    'INFY.NS',      # IT Services
+    'ICICIBANK.NS', # Banking
+    'HINDUNILVR.NS',# FMCG
+    'MARUTI.NS'     # Automobile
+]
+
+# Set a 5-year historical window
+START_DATE = '2014-01-01'
+END_DATE = datetime.now().strftime('%Y-%m-%d')  # Use today's date dynamically
+
+try:
+    print(f"Downloading data from {START_DATE} to {END_DATE}...")
+    
+    # Download the data
+    raw_data = yf.download(TICKERS, start=START_DATE, end=END_DATE, progress=False)
+    
+    # Check if download was successful
+    if raw_data.empty:
+        raise ValueError("Downloaded data is empty. Check your internet connection or ticker symbols.")
+    
+    # Extract Adjusted Close prices
+    # Handle MultiIndex columns (when downloading multiple tickers)
+    if isinstance(raw_data.columns, pd.MultiIndex):
+        # MultiIndex structure: Level 0 = metric names, Level 1 = ticker symbols
+        # Check available metrics in level 0
+        level_0_values = raw_data.columns.get_level_values(0).unique()
+        
+        # Try different possible column names for adjusted close
+        adj_close_names = ['Adj Close', 'AdjClose', 'Adjusted Close', 'Close']
+        adj_close_col = None
+        
+        for col_name in adj_close_names:
+            if col_name in level_0_values:
+                adj_close_col = col_name
+                break
+        
+        if adj_close_col is None:
+            available_cols = list(level_0_values)
+            raise KeyError(f"Adjusted Close column not found. Available columns: {available_cols}")
+        
+        # Extract the adjusted close data using xs() method for MultiIndex
+        data = raw_data.xs(adj_close_col, level=0, axis=1)
+        
+    else:
+        # Single ticker or flat structure
+        # Try different possible column names
+        adj_close_names = ['Adj Close', 'AdjClose', 'Adjusted Close', 'Close']
+        adj_close_col = None
+        
+        for col_name in adj_close_names:
+            if col_name in raw_data.columns:
+                adj_close_col = col_name
+                break
+        
+        if adj_close_col is None:
+            available_cols = raw_data.columns.tolist()
+            raise KeyError(f"Adjusted Close column not found. Available columns: {available_cols}")
+        
+        data = raw_data[adj_close_col]
+    
+    # Handle case where data might be a Series (single ticker) vs DataFrame (multiple tickers)
+    if isinstance(data, pd.Series):
+        data = data.to_frame()
+        data.columns = [TICKERS[0]] if len(TICKERS) == 1 else ['PRICE']
+    
+    # Validate data is not empty after extraction
+    if data.empty:
+        raise ValueError("Adjusted Close data is empty after extraction.")
+    
+    # Clean column names (remove extra whitespace)
+    if isinstance(data, pd.DataFrame):
+        data.columns = data.columns.str.strip()
+    
+    print(f"\nDownload successful! Data shape: {data.shape}")
+    print(f"Date range: {data.index.min()} to {data.index.max()}")
+    print(f"Tickers downloaded: {len(data.columns)}")
+    print("\nData Head:")
+    print(data.head().to_markdown(numalign="left", stralign="left"))
+    
+except KeyError as e:
+    print(f"Error accessing data: {e}")
+    print("The data structure returned may be different than expected.")
+    if 'raw_data' in locals():
+        print(f"Column structure type: {type(raw_data.columns)}")
+        if isinstance(raw_data.columns, pd.MultiIndex):
+            print(f"MultiIndex level 0 values: {list(raw_data.columns.get_level_values(0).unique())}")
+        else:
+            print(f"Available columns: {list(raw_data.columns)}")
+    
+except ValueError as e:
+    print(f"Data validation error: {e}")
+    
+except Exception as e:
+    # This will catch nearly all errors, including connection issues
+    print(f"Error downloading data from Yahoo Finance: {e}")
+    print("Possible causes: Invalid ticker symbols, network issues, or API limits.")
+    import traceback
+    traceback.print_exc()
+##STEP 2A( RETURNS CHECK KAR RAHA HAI FOR REALTIVE CHANGE IN PERCENTAGE pct.change = today-yesterday/yesterday)
+
+if data is None or data.empty:
+    raise ValueError("The 'data' DataFrame is empty. Cannot calculate returns.")
+
+if data.shape[0] < 2:
+    raise ValueError(f"Not enough rows in 'data' ({data.shape[0]}) to calculate daily returns.")
+
+print("Data is suitable for calculating returns.")
+
+print("\n--- Step 2A: Calculating Returns ---")
+
+# 1. Calculate Daily Percentage Returns for all stocks
+# pct_change() calculates: (Today's Price / Yesterday's Price) - 1
+returns_df = data.pct_change()
+
+# 2. Remove the first row containing NaN (since there is no previous day to calculate return)
+returns_df = returns_df.dropna()
+
+print(f"Returns DataFrame created. Shape: {returns_df.shape}")
+print("\nSample Daily Returns:")
+print(returns_df.head().to_markdown(numalign="left", stralign="left"))
+
+# The 'returns_df' is now ready for Feature Engineering in Step 2B.
+
+##STEP 2B( FEATURE ENGINEERING )
+
+
+# If you want to select a subset of features, you can specify them here.
+# For example, let's ensure we're using only desired, meaningful features for modeling.
+# You can adjust this list as needed for different experiments.
+
+selected_features = [
+    'Lag_1_Return',
+    'Lag_5_Return',
+    'Volatility_21D',
+    'Momentum_5D'
+]
+
+def step_2b_feature_engineering(returns_df):
+    """
+    Creates input signals (features) for the ML model.
+    """
+    # 1. Start with an empty DataFrame linked to the dates of your returns
+    X_features = pd.DataFrame(index=returns_df.index)
+    
+    # 2. FEATURE: Portfolio Return Momentum (Lags)
+    # Why? Helps the model see if the whole market was up or down recently.
+    # We take the average return of all stocks and shift them.
+    all_stock_avg = returns_df.mean(axis=1)
+    
+    X_features['Lag_1_Return'] = all_stock_avg.shift(1)  # Average Return Yesterday
+    X_features['Lag_5_Return'] = all_stock_avg.shift(5)  # Average Return 5 days ago
+
+    # 3. FEATURE: Rolling Volatility (Proxy for Risk)
+    # Standard deviation over the last 21 trading days (approx 1 month).
+    # This captures how 'jumpy' the market has been.
+    X_features['Volatility_21D'] = returns_df.rolling(window=21).std().mean(axis=1)
+
+    # 4. FEATURE: Rolling Momentum (Weekly Trend)
+    # Mean of returns over the last 5 days.
+    X_features['Momentum_5D'] = returns_df.rolling(window=5).mean().mean(axis=1)
+
+    # 5. DATA CLEANING
+    # The rolling windows cause NaNs at the very beginning (need 21 days of data).
+    # We drop those rows so the model has a complete dataset.
+    X_features = X_features.dropna()
+    
+    return X_features
+
+# EXECUTE:
+X_features_df = step_2b_feature_engineering(returns_df)
+
+print(f"Step 2B complete! Created {len(X_features_df.columns)} features.")
+print(f"Number of trading days for training: {len(X_features_df)}")
+print("\nFirst 5 rows of your Input Features (Signals):")
+print(X_features_df.head().to_markdown(numalign="left", stralign="left"))
+
+# --- Feature Selection ---
+# If you want to select a subset of features, you can specify them here.
+# For example, let's ensure we're using only desired, meaningful features for modeling.
+# You can adjust this list as needed for different experiments.
+
+# Check which of the selected features exist in X_features_df
+available_features = [f for f in selected_features if f in X_features_df.columns]
+missing_features = [f for f in selected_features if f not in X_features_df.columns]
+
+if missing_features:
+    print(f"\nWarning: The following selected features are not in the features DataFrame and will be ignored: {missing_features}")
+
+# Use ONLY the selected (and available) features for ML input going forward
+X_features_df = X_features_df[available_features].copy()
+
+print(f"\nFeatures used for modeling: {list(X_features_df.columns)}")
+
+
+
+#STEP 2C
+# Code review for errors and unnamed variables:
+
+# 1. The variable `selected_features` is used but not defined or assigned in the visible context before its first usage.
+#    This will cause a NameError. You likely need to assign it.
+#    For demonstration, we'll set it to include all columns in X_features_df if it's not already defined.
+
+if 'selected_features' not in locals():
+    selected_features = list(X_features_df.columns)
+
+# 2. No other obvious errors such as unassigned variables or misspelled names were detected in the shown code block.
+
+
+def step_2c_define_targets(returns, features):
+    """
+    Defines the prediction targets (Y) by aligning tomorrow's returns (t+1) 
+    with today's features (t).
+    
+    Args:
+        returns (pd.DataFrame): The full returns_df from Step 2A.
+        features (pd.DataFrame): The X_features_df from Step 2B.
+    """
+    
+    # 1. Target Mean Return Vector (Y_mu_target)
+    # Shifting by -1 aligns tomorrow's return (t+1) with today's feature set (t).
+    Y_mu_target = returns.shift(-1) 
+    
+    # 2. Align Features (X) and Targets (Y)
+    # We must ensure X and Y have the exact same dates and number of rows.
+    
+    # Start with the index of the Features (X_aligned), as these are the cleanest
+    X_aligned = features.copy()
+    
+    # Filter the Targets (Y) using the Feature index
+    Y_aligned = Y_mu_target.loc[X_aligned.index].dropna()
+    
+    # Filter the Features (X) again using the resulting Target index (removes the last row)
+    X_aligned = X_aligned.loc[Y_aligned.index] 
+    
+    # Final check: X and Y must have the exact same number of rows for training
+    if X_aligned.shape[0] != Y_aligned.shape[0]:
+        print("ERROR: Feature and Target counts do not match!")
+        return None
+    
+    print(f"Alignment complete! Final training samples: {X_aligned.shape[0]} days.")
+    
+    # These are now ready to be converted to NumPy arrays or PyTorch Tensors for training
+    return X_aligned, Y_aligned
+
+# EXECUTE:
+result = step_2c_define_targets(returns_df, X_features_df)
+
+if result is None:
+    raise ValueError("Failed to align features and targets. Cannot proceed with model training.")
+
+X_final, Y_final = result
+
+print("\nSample of Target Returns (What the model is predicting for tomorrow):")
+print(Y_final.head().to_markdown(numalign="left", stralign="left"))
+
+print("\n--- Step 2C Complete ---")
+print(f"Final feature matrix (X_final) shape: {X_final.shape}")
+print(f"Final target matrix (Y_final) shape: {Y_final.shape}")
+print("\nSample of Features (X_final):")
+print(X_final.head().to_markdown(numalign="left", stralign="left"))
