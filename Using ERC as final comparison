@@ -1,0 +1,131 @@
+import torch
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from sklearn.covariance import LedoitWolf  # Used for robust covariance estimation
+from torch.utils.data import TensorDataset, DataLoader
+import importlib.util
+import sys
+
+# --- Import required variables from lstm.py ---
+# Import lstm.py as a module to access X_tensor, Y_tensor, model, and N_ASSETS
+spec = importlib.util.spec_from_file_location("lstm_module", "lstm.py")
+lstm_module = importlib.util.module_from_spec(spec)
+sys.modules["lstm_module"] = lstm_module
+spec.loader.exec_module(lstm_module)
+
+# Extract the variables we need from lstm.py
+try:
+    X_tensor = lstm_module.X_tensor
+    Y_tensor = lstm_module.Y_tensor
+    model = lstm_module.model
+    N_ASSETS = lstm_module.N_ASSETS
+except AttributeError as e:
+    raise ValueError(f"Failed to import required variables from lstm.py. Error: {e}\n"
+                     "Make sure lstm.py has been run successfully and all variables are defined:\n"
+                     "- X_tensor\n"
+                     "- Y_tensor\n"
+                     "- model\n"
+                     "- N_ASSETS")
+
+# Validate the imported variables
+if X_tensor is None or Y_tensor is None:
+    raise ValueError("X_tensor or Y_tensor is None. Check lstm.py execution.")
+if model is None:
+    raise ValueError("model is None. Check lstm.py execution.")
+if N_ASSETS is None or N_ASSETS <= 0:
+    raise ValueError(f"N_ASSETS is invalid: {N_ASSETS}. Check lstm.py execution.")
+
+print(f"\n--- Evaluation: Variables Imported Successfully ---")
+print(f"X_tensor shape: {X_tensor.shape}")
+print(f"Y_tensor shape: {Y_tensor.shape}")
+print(f"Number of assets: {N_ASSETS}")
+
+# --- 1. Split Data into Training and Testing Sets ---
+# We use a time-series split (first 80% for training, last 20% for testing)
+split_point = int(0.8 * len(X_tensor))
+
+X_train, X_test = X_tensor[:split_point], X_tensor[split_point:]
+Y_train, Y_test = Y_tensor[:split_point], Y_tensor[split_point:]
+
+# We need the true realized returns for evaluation purposes
+Y_true_test = Y_test.detach().numpy()
+
+print(f"\n--- Step 4: Evaluation ---")
+print(f"Test Samples: {len(X_test)}")
+
+# --- 2. Generate Predictions on Test Set ---
+model.eval() # Set model to evaluation mode
+with torch.no_grad():
+    # Predict the returns (mu_hat) for all days in the test set
+    mu_hat_test_tensor = model(X_test)
+    mu_hat_test = mu_hat_test_tensor.detach().numpy()
+
+# --- 3. Optimization and Weight Calculation (Two-Stage Approach) ---
+
+# We need a risk estimate (Sigma_hat). In the traditional two-stage model, 
+# we often use a historical or rolling covariance.
+# For robustness, we use Ledoit-Wolf shrinkage estimation which provides
+# more stable covariance estimates, especially with limited data.
+
+Y_train_np = Y_train.detach().numpy()
+# Apply Shrinkage Estimation (The robust fix)
+lw = LedoitWolf()
+lw.fit(Y_train_np)
+sigma_hat = lw.covariance_  # Use the shrunk, robust covariance matrix
+
+# Lists to store daily portfolio results
+portfolio_weights = []
+portfolio_returns = []
+
+# Assuming a Risk-Free Rate (Rf) of 5% annualized for the Indian market
+# Convert to daily rate: (1 + annual_rate)^(1/252) - 1 ≈ annual_rate / 252
+risk_free_rate_annual = 0.05
+risk_free_rate_daily = risk_free_rate_annual / 252  # Convert 5% annualized rate to daily
+
+# Iterate over each day in the test set
+for t in range(len(Y_true_test)):
+    # Note: ERC approximation ignores mu_t, relying only on stable risk (sigma_hat)
+    
+    try:
+        # 1. Calculate the standard deviation (volatility) of each asset
+        asset_volatility = np.sqrt(np.diag(sigma_hat))
+
+        # 2. Calculate the reciprocal of volatility (inverse risk)
+        # The less volatile an asset is, the higher its weight.
+        inverse_volatility = 1.0 / asset_volatility
+
+        # 3. Normalize to get the final weights (w*)
+        w_optimal = inverse_volatility / np.sum(inverse_volatility)
+        
+    except Exception: # Catch any math error
+        # Fallback to equal weights
+        w_optimal = np.ones(N_ASSETS) / N_ASSETS
+
+    # Ensure weights are normalized to sum to 1
+    w_optimal = w_optimal / np.sum(w_optimal)
+    
+    # b. Evaluate the Portfolio Decision (using the *True* realized returns)
+    r_true_t = Y_true_test[t]
+    
+    # Portfolio Return = w* @ r_true_t
+    daily_return = np.dot(w_optimal, r_true_t)
+    
+    portfolio_weights.append(w_optimal)
+    portfolio_returns.append(daily_return)
+
+# --- 4. Final Evaluation Metrics ---
+
+portfolio_returns = np.array(portfolio_returns)
+annualized_returns = np.mean(portfolio_returns) * 252 # 252 trading days/year
+annualized_volatility = np.std(portfolio_returns) * np.sqrt(252)
+
+# Assuming a Risk-Free Rate (Rf) of 5% (0.05) for the Indian market
+risk_free_rate = 0.05 
+sharpe_ratio = (annualized_returns - risk_free_rate) / annualized_volatility
+
+print("\n--- FINAL ROBUST SPO Performance (ERC Approximation) ---")
+print(f"Annualized Return: {annualized_returns * 100:.2f}%")
+print(f"Annualized Volatility: {annualized_volatility * 100:.2f}%")
+print(f"Sharpe Ratio (Rf=5%): {sharpe_ratio:.3f}")
+print("-------------------------------------------------")
